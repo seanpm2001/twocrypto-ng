@@ -127,6 +127,9 @@ event ClaimAdminFee:
     admin: indexed(address)
     tokens: uint256[N_COINS]
 
+event NewGulper:
+    new_gulper: indexed(address)
+
 
 # ----------------------- Storage/State Variables ----------------------------
 
@@ -180,6 +183,8 @@ NOISE_FEE: constant(uint256) = 10**5  # <---------------------------- 0.1 BPS.
 
 # ----------------------- Admin params ---------------------------------------
 
+gulper: public(address)
+future_gulper: public(address)
 last_admin_fee_claim_timestamp: uint256
 admin_lp_virtual_balance: uint256
 
@@ -233,6 +238,11 @@ def __init__(
     packed_rebalancing_params: uint256,
     initial_price: uint256,
 ):
+
+    # Address that deploys the contract is the initial gulper.
+    # They can change the gulper to another address without
+    # admin's permission. Admin can also change the gulper.
+    self.gulper = tx.origin
 
     MATH = Math(_math)
 
@@ -1113,6 +1123,25 @@ def _claim_admin_fees():
         log ClaimAdminFee(fee_receiver, admin_tokens)
 
 
+@external
+def gulp():
+    """
+    @notice Gulps rebases and rebalances liquidity
+    @dev This is a protected method
+    """
+    assert msg.sender == self.gulper  # dev: only owner
+
+    # ----------------------------- gulp rebases -----------------------------
+
+
+    # ----------------------------- tweak prices -----------------------------
+
+
+    # --------------------------------- log ----------------------------------
+
+    pass
+
+
 @internal
 @pure
 def xp(
@@ -1955,3 +1984,37 @@ def apply_new_parameters(
         new_ma_time,
         _new_xcp_ma_time,
     )
+
+
+@external
+def set_new_gulper(_new_gulper: address):
+    """
+    @notice Sets the address of the future gulper.
+    @param _new_gulper The address of the new gulper
+    @dev To finalise the new gulper, the future_gulper must accept their new responsibility.
+    """
+    assert msg.sender in [self.gulper, factory.admin()]  # dev: permissioned method
+    self.future_gulper = _new_gulper
+
+
+@external
+def accept_new_gulper():
+    """
+    @notice Updates the address of the gulper
+    @dev Only callable by the future_gulper
+    """
+
+    assert msg.sender == self.future_gulper  # dev: permissioned method
+    self.gulper = self.future_gulper
+
+    log NewGulper(self.gulper)
+
+
+@external
+def revert_new_gulper():
+    """
+    @notice Reverts the address set in future_gulper
+    @dev Only callable by current gulper and the factory admin
+    """
+    assert msg.sender in [self.gulper, factory.admin()]  # dev: permissioned method
+    self.future_gulper = empty(address)
