@@ -300,37 +300,14 @@ def _transfer_in(
     _coin_idx: uint256,
     _dx: uint256,
     sender: address,
-    expect_optimistic_transfer: bool,
-) -> uint256:
+):
     """
     @notice Transfers `_coin` from `sender` to `self` and calls `callback_sig`
             if it is not empty.
     @params _coin_idx uint256 Index of the coin to transfer in.
     @params dx amount of `_coin` to transfer into the pool.
     @params sender address to transfer `_coin` from.
-    @params expect_optimistic_transfer bool True if pool expects user to transfer.
-            This is only enabled for exchange_received.
-    @return The amount of tokens received.
     """
-    coin_balance: uint256 = ERC20(coins[_coin_idx]).balanceOf(self)
-
-    if expect_optimistic_transfer:  # Only enabled in exchange_received:
-        # it expects the caller of exchange_received to have sent tokens to
-        # the pool before calling this method.
-
-        # If someone donates extra tokens to the contract: do not acknowledge.
-        # We only want to know if there are dx amount of tokens. Anything extra,
-        # we ignore. This is why we need to check if received_amounts (which
-        # accounts for coin balances of the contract) is atleast dx.
-        # If we checked for received_amounts == dx, an extra transfer without a
-        # call to exchange_received will break the method.
-        dx: uint256 = coin_balance - self.balances[_coin_idx]
-        assert dx >= _dx  # dev: user didn't give us coins
-
-        # Adjust balances
-        self.balances[_coin_idx] += dx
-
-        return dx
 
     # ----------------------------------------------- ERC20 transferFrom flow.
 
@@ -341,10 +318,7 @@ def _transfer_in(
         _dx,
         default_return_value=True
     )
-
-    dx: uint256 = ERC20(coins[_coin_idx]).balanceOf(self) - coin_balance
-    self.balances[_coin_idx] += dx
-    return dx
+    self.balances[_coin_idx] += _dx
 
 
 @internal
@@ -391,18 +365,13 @@ def exchange(
     @return uint256 Amount of tokens at index j received by the `receiver
     """
     # _transfer_in updates self.balances here:
-    dx_received: uint256 = self._transfer_in(
-        i,
-        dx,
-        msg.sender,
-        False
-    )
+    self._transfer_in(i, dx, msg.sender)
 
     # No ERC20 token transfers occur here:
     out: uint256[3] = self._exchange(
         i,
         j,
-        dx_received,
+        dx,
         min_dy,
     )
 
@@ -411,56 +380,7 @@ def exchange(
     self._transfer_out(j, out[0], receiver)
 
     # log:
-    log TokenExchange(msg.sender, i, dx_received, j, out[0], out[1], out[2])
-
-    return out[0]
-
-
-@external
-@nonreentrant('lock')
-def exchange_received(
-    i: uint256,
-    j: uint256,
-    dx: uint256,
-    min_dy: uint256,
-    receiver: address = msg.sender,
-) -> uint256:
-    """
-    @notice Exchange: but user must transfer dx amount of coin[i] tokens to pool first.
-            Pool will not call transferFrom and will only check if a surplus of
-            coins[i] is greater than or equal to `dx`.
-    @dev Use-case is to reduce the number of redundant ERC20 token
-         transfers in zaps. Primarily for dex-aggregators/arbitrageurs/searchers.
-         Note for users: please transfer + exchange_received in 1 tx.
-    @param i Index value for the input coin
-    @param j Index value for the output coin
-    @param dx Amount of input coin being swapped in
-    @param min_dy Minimum amount of output coin to receive
-    @param receiver Address to send the output coin to
-    @return uint256 Amount of tokens at index j received by the `receiver`
-    """
-    # _transfer_in updates self.balances here:
-    dx_received: uint256 = self._transfer_in(
-        i,
-        dx,
-        msg.sender,
-        True  # <---- expect_optimistic_transfer is set to True here.
-    )
-
-    # No ERC20 token transfers occur here:
-    out: uint256[3] = self._exchange(
-        i,
-        j,
-        dx_received,
-        min_dy,
-    )
-
-    # _transfer_out updates self.balances here. Update to state occurs before
-    # external calls:
-    self._transfer_out(j, out[0], receiver)
-
-    # log:
-    log TokenExchange(msg.sender, i, dx_received, j, out[0], out[1], out[2])
+    log TokenExchange(msg.sender, i, dx, j, out[0], out[1], out[2])
 
     return out[0]
 
@@ -495,20 +415,14 @@ def add_liquidity(
 
     # -------------------------------------- Update balances and calculate xp.
     xp_old: uint256[N_COINS] = xp
-    amounts_received: uint256[N_COINS] = empty(uint256[N_COINS])
 
     ########################## TRANSFER IN <-------
 
     for i in range(N_COINS):
         if amounts[i] > 0:
             # Updates self.balances here:
-            amounts_received[i] = self._transfer_in(
-                i,
-                amounts[i],
-                msg.sender,
-                False,  # <--------------------- Disable optimistic transfers.
-            )
-            xp[i] = xp[i] + amounts_received[i]
+            self._transfer_in(i, amounts[i], msg.sender)
+            xp[i] = xp[i] + amounts[i]
 
     xp = [
         xp[0] * PRECISIONS[0],
@@ -520,7 +434,7 @@ def add_liquidity(
     ]
 
     for i in range(N_COINS):
-        if amounts_received[i] > 0:
+        if amounts[i] > 0:
             amountsp[i] = xp[i] - xp_old[i]
 
     # -------------------- Calculate LP tokens to mint -----------------------
@@ -577,7 +491,7 @@ def add_liquidity(
 
     log AddLiquidity(
         receiver,
-        amounts_received,
+        amounts,
         d_token_fee,
         token_supply,
         price_scale
