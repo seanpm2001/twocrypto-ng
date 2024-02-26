@@ -8,12 +8,11 @@
 @notice A Curve AMM pool for 2 unpegged assets (e.g. stWETH, USDM) with
         rebasing implementation.
 @dev 1. All prices in the AMM are with respect to the first token in the pool.
-     2. All rebases are taken away for rebalancing liquidity in the pool.
-        Users deposits do not earn rebases from the respective tokens. This tradeoff
-        could be worth it if they are appropriately compensated for giving up their
-        rebases. The value add here is that liquidity is rebalanced more frequently,
-        leading to a deeper liquidity profile, hence more swaps and hence more
-        yield from swaps (in comparison to a non-rebasing twocrypto implementation).
+     Yet to accomplish objectives:
+     2. All rebases go to the users, and none to admin. No rebases are eaten
+        during pool rebalancing.
+     3. Gulp method allows anyone to pull tokens from a designated contract, donate
+        to the pool contract and rebalance pool.
 
 """
 
@@ -127,8 +126,8 @@ event ClaimAdminFee:
     admin: indexed(address)
     tokens: uint256[N_COINS]
 
-event NewGulper:
-    new_gulper: indexed(address)
+event NewDonationSource:
+    donation_source_contract_address: indexed(address)
 
 
 # ----------------------- Storage/State Variables ----------------------------
@@ -183,8 +182,7 @@ NOISE_FEE: constant(uint256) = 10**5  # <---------------------------- 0.1 BPS.
 
 # ----------------------- Admin params ---------------------------------------
 
-gulper: public(address)
-future_gulper: public(address)
+donation_source_contract: public(address)
 last_admin_fee_claim_timestamp: uint256
 admin_lp_virtual_balance: uint256
 
@@ -213,9 +211,6 @@ nonces: public(HashMap[address, uint256])
 EIP712_TYPEHASH: constant(bytes32) = keccak256(
     "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract,bytes32 salt)"
 )
-EIP2612_TYPEHASH: constant(bytes32) = keccak256(
-    "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)"
-)
 VERSION_HASH: constant(bytes32) = keccak256(version)
 NAME_HASH: immutable(bytes32)
 CACHED_CHAIN_ID: immutable(uint256)
@@ -238,11 +233,6 @@ def __init__(
     packed_rebalancing_params: uint256,
     initial_price: uint256,
 ):
-
-    # Address that deploys the contract is the initial gulper.
-    # They can change the gulper to another address without
-    # admin's permission. Admin can also change the gulper.
-    self.gulper = tx.origin
 
     MATH = Math(_math)
 
@@ -1126,12 +1116,16 @@ def _claim_admin_fees():
 @external
 def gulp():
     """
-    @notice Gulps rebases and rebalances liquidity
-    @dev This is a protected method
+    @notice Gulps tokens from self.donation_source_contract and rebalances liquidity
+    @dev To test if this actually works, invariant should be:
+         1. No user positions lose underling balances.
+         2. virtual price stays the same or goes up.
     """
-    assert msg.sender == self.gulper  # dev: only owner
+
+    A_gamma: uint256[2] = self._A_gamma()
 
     # ----------------------------- gulp rebases -----------------------------
+
 
 
     # ----------------------------- tweak prices -----------------------------
@@ -1293,7 +1287,7 @@ def _calc_withdraw_one_coin(
 
     # --------- Calculate `approx_fee` (assuming balanced state) in ith token.
     # -------------------------------- We only need this for fee in the event.
-    approx_fee: uint256 = N_COINS * D_fee * xx[i] / D  # <------------------<---------- TODO: Check math.
+    approx_fee: uint256 = N_COINS * D_fee * xx[i] / D
 
     # ------------------------------------------------------------------------
     D -= (dD - D_fee)  # <----------------------------------- Charge fee on D.
@@ -1384,53 +1378,6 @@ def approve(_spender: address, _value: uint256) -> bool:
     self._approve(msg.sender, _spender, _value)
     return True
 
-
-@external
-def permit(
-    _owner: address,
-    _spender: address,
-    _value: uint256,
-    _deadline: uint256,
-    _v: uint8,
-    _r: bytes32,
-    _s: bytes32,
-) -> bool:
-    """
-    @notice Permit `_spender` to spend up to `_value` amount of `_owner`'s
-            tokens via a signature.
-    @dev In the event of a chain fork, replay attacks are prevented as
-         domain separator is recalculated. However, this is only if the
-         resulting chains update their chainId.
-    @param _owner The account which generated the signature and is granting an
-                  allowance.
-    @param _spender The account which will be granted an allowance.
-    @param _value The approval amount.
-    @param _deadline The deadline by which the signature must be submitted.
-    @param _v The last byte of the ECDSA signature.
-    @param _r The first 32 bytes of the ECDSA signature.
-    @param _s The second 32 bytes of the ECDSA signature.
-    @return bool Success.
-    """
-    assert _owner != empty(address)  # dev: invalid owner
-    assert block.timestamp <= _deadline  # dev: permit expired
-
-    nonce: uint256 = self.nonces[_owner]
-    digest: bytes32 = keccak256(
-        concat(
-            b"\x19\x01",
-            self._domain_separator(),
-            keccak256(
-                _abi_encode(
-                    EIP2612_TYPEHASH, _owner, _spender, _value, nonce, _deadline
-                )
-            ),
-        )
-    )
-    assert ecrecover(digest, _v, _r, _s) == _owner  # dev: invalid signature
-
-    self.nonces[_owner] = unsafe_add(nonce, 1)  # <-- Unsafe add is safe here.
-    self._approve(_owner, _spender, _value)
-    return True
 
 
 @internal
@@ -1987,34 +1934,12 @@ def apply_new_parameters(
 
 
 @external
-def set_new_gulper(_new_gulper: address):
+def set_new_donation_source(_new_source: address):
     """
-    @notice Sets the address of the future gulper.
-    @param _new_gulper The address of the new gulper
-    @dev To finalise the new gulper, the future_gulper must accept their new responsibility.
+    @notice Sets the address of the new source.
+    @param _new_source The address of the new donation source
     """
-    assert msg.sender in [self.gulper, factory.admin()]  # dev: permissioned method
-    self.future_gulper = _new_gulper
+    assert msg.sender == factory.admin()  # dev: permissioned method
+    self.donation_source_contract = _new_source
 
-
-@external
-def accept_new_gulper():
-    """
-    @notice Updates the address of the gulper
-    @dev Only callable by the future_gulper
-    """
-
-    assert msg.sender == self.future_gulper  # dev: permissioned method
-    self.gulper = self.future_gulper
-
-    log NewGulper(self.gulper)
-
-
-@external
-def revert_new_gulper():
-    """
-    @notice Reverts the address set in future_gulper
-    @dev Only callable by current gulper and the factory admin
-    """
-    assert msg.sender in [self.gulper, factory.admin()]  # dev: permissioned method
-    self.future_gulper = empty(address)
+    log NewDonationSource(_new_source)
